@@ -319,19 +319,63 @@ body {
     background: rgba(244, 63, 94, 0.12); color: #fb7185;
     border: 1px solid rgba(244, 63, 94, 0.3);
     font-size: 0.78rem; font-weight: 600;
-    padding: 5px 14px;
+    padding: 0; /* padding moved to inner sections */
+    overflow: hidden;
+    display: inline-flex; align-items: stretch;
 }
-.tag-badge.f95.clickable { cursor: pointer; }
 .tag-badge.f95.clickable:hover {
-    background: rgba(244, 63, 94, 0.25);
-    border-color: rgba(244, 63, 94, 0.5);
     box-shadow: 0 0 12px rgba(244, 63, 94, 0.2);
-    transform: scale(1.08);
+    transform: scale(1.05);
+}
+.f95-toggle-section {
+    padding: 5px 8px; cursor: pointer;
+    background: rgba(0,0,0,0.15);
+    border-right: 1px solid rgba(244, 63, 94, 0.2);
+    display: flex; align-items: center;
+    transition: background var(--transition-fast);
+}
+.f95-toggle-section:hover { background: rgba(255,255,255,0.1); }
+.f95-content-section {
+    padding: 5px 10px; cursor: pointer;
+    display: flex; align-items: center;
+    transition: background var(--transition-fast);
+}
+.f95-content-section:hover { background: rgba(255,255,255,0.08); }
+.tag-badge.f95.active .f95-toggle-section {
+    border-right-color: rgba(16, 185, 129, 0.3);
 }
 .tag-badge.f95 .tag-score {
     background: rgba(244, 63, 94, 0.25); border-radius: 10px;
     padding: 1px 6px; font-size: 0.65rem; color: #fda4af; margin-left: 2px;
 }
+.f95-dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    background: rgba(255, 255, 255, 0.3);
+    transition: all var(--transition-fast);
+}
+.tag-badge.f95.active {
+    background: rgba(16, 185, 129, 0.15);
+    border-color: rgba(16, 185, 129, 0.4);
+    color: #34d399;
+}
+.tag-badge.f95.active .f95-dot {
+    background: #10b981;
+    box-shadow: 0 0 8px rgba(16, 185, 129, 0.6);
+}
+.f95-result-area {
+    margin-top: 16px; padding: 12px 16px;
+    background: rgba(0, 0, 0, 0.4); border-radius: var(--radius-sm);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+}
+.f95-result-text {
+    flex: 1; font-family: 'JetBrains Mono', monospace; font-size: 0.85rem;
+    color: var(--accent-cyan-bright); word-break: break-word;
+}
+.copy-btn {
+    flex-shrink: 0; background: rgba(255,255,255,0.08); border-radius: var(--radius-sm);
+}
+.copy-btn:hover { background: rgba(255,255,255,0.15); color: #fff; }
 
 /* ─── F95 Source Modal ─── */
 .f95-modal-overlay {

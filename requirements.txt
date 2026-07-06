@@ -1,7 +1,6 @@
 fastapi
 uvicorn[standard]
-onnxruntime
+onnxruntime-gpu
 huggingface_hub
 pillow
-pandas
-python-multipart
+opencv-python-headless

@@ -8,14 +8,16 @@ import hashlib
 import io
 import os
 import zipfile
+import csv
+import shutil
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import cv2
 import onnxruntime as ort
-import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -28,11 +30,13 @@ from pydantic import BaseModel
 # Configuration
 # ──────────────────────────────────────────────
 
-MODEL_REPO = "SmilingWolf/wd-v1-4-swinv2-tagger-v2"
+MODEL_REPO = "SmilingWolf/wd-swinv2-tagger-v3"
 MODEL_FILE = "model.onnx"
 TAGS_FILE = "selected_tags.csv"
 IMAGE_SIZE = 448
-SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff", ".tif"}
+SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff", ".tif"}
+SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm", ".mov"}
+SUPPORTED_EXTENSIONS = SUPPORTED_IMAGE_EXTENSIONS | SUPPORTED_VIDEO_EXTENSIONS
 
 DEFAULT_GENERAL_THRESHOLD = 0.35
 DEFAULT_CHARACTER_THRESHOLD = 0.85
@@ -60,7 +64,8 @@ app.add_middleware(
 # Global state
 model_state = {
     "session": None,
-    "tags_df": None,
+    "tag_names": None,
+    "tag_categories": None,
     "status": "not_loaded",  # not_loaded | loading | ready | error
     "error": None,
 }
@@ -83,11 +88,6 @@ class TagRequest(BaseModel):
     character_threshold: float = DEFAULT_CHARACTER_THRESHOLD
 
 
-class TagAllRequest(BaseModel):
-    general_threshold: float = DEFAULT_GENERAL_THRESHOLD
-    character_threshold: float = DEFAULT_CHARACTER_THRESHOLD
-
-
 class ExportRequest(BaseModel):
     image_id: str
     use_hash: bool = True
@@ -102,12 +102,29 @@ class ExportAllRequest(BaseModel):
 # ──────────────────────────────────────────────
 
 def load_model():
-    """Download and load the WD SwinV2 Tagger V2 model."""
+    """Download and load the WD SwinV2 Tagger V3 model."""
     model_state["status"] = "loading"
     try:
-        print("[LewdTagger] Downloading model from HuggingFace...")
-        model_path = hf_hub_download(repo_id=MODEL_REPO, filename=MODEL_FILE)
-        tags_path = hf_hub_download(repo_id=MODEL_REPO, filename=TAGS_FILE)
+        cache_dir = Path("model_cache_v3")
+        cache_dir.mkdir(exist_ok=True)
+        local_model_path = cache_dir / MODEL_FILE
+        local_tags_path = cache_dir / TAGS_FILE
+        
+        if local_model_path.exists() and local_tags_path.exists():
+            print("[LewdTagger] Model found in local cache, skipping download.")
+            model_path = str(local_model_path)
+            tags_path = str(local_tags_path)
+        else:
+            print("[LewdTagger] Downloading model from HuggingFace...")
+            hf_model_path = hf_hub_download(repo_id=MODEL_REPO, filename=MODEL_FILE)
+            hf_tags_path = hf_hub_download(repo_id=MODEL_REPO, filename=TAGS_FILE)
+            
+            print("[LewdTagger] Saving to local cache...")
+            shutil.copy2(hf_model_path, local_model_path)
+            shutil.copy2(hf_tags_path, local_tags_path)
+            
+            model_path = str(local_model_path)
+            tags_path = str(local_tags_path)
 
         print("[LewdTagger] Loading ONNX model...")
         providers = []
@@ -118,14 +135,22 @@ def load_model():
         providers.append("CPUExecutionProvider")
 
         session = ort.InferenceSession(model_path, providers=providers)
-        tags_df = pd.read_csv(tags_path)
+        
+        tag_names = []
+        tag_categories = []
+        with open(tags_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                tag_names.append(row["name"])
+                tag_categories.append(int(row["category"]))
 
         model_state["session"] = session
-        model_state["tags_df"] = tags_df
+        model_state["tag_names"] = tag_names
+        model_state["tag_categories"] = tag_categories
         model_state["status"] = "ready"
         model_state["error"] = None
 
-        print(f"[LewdTagger] [OK] Model loaded successfully ({len(tags_df)} tags)")
+        print(f"[LewdTagger] [OK] Model loaded successfully ({len(tag_names)} tags)")
         print(f"[LewdTagger] [OK] Providers: {session.get_providers()}")
 
     except Exception as e:
@@ -147,9 +172,12 @@ def compute_hash(filepath: str) -> str:
     return h.hexdigest()
 
 
-def prepare_image(image_path: str) -> np.ndarray:
+def prepare_image(image_input) -> np.ndarray:
     """Load and preprocess image for the model (448x448, float32, BGR)."""
-    img = Image.open(image_path).convert("RGBA")
+    if isinstance(image_input, str):
+        img = Image.open(image_input).convert("RGBA")
+    else:
+        img = image_input.convert("RGBA")
 
     # Create white background for transparent images
     background = Image.new("RGBA", img.size, (255, 255, 255, 255))
@@ -176,24 +204,21 @@ def prepare_image(image_path: str) -> np.ndarray:
     return img_array
 
 
-def run_inference(image_path: str, general_threshold: float, character_threshold: float) -> dict:
+def run_inference(image_input, general_threshold: float, character_threshold: float) -> dict:
     """Run the WD tagger model on an image and return categorized tags."""
     session = model_state["session"]
-    tags_df = model_state["tags_df"]
+    tag_names = model_state["tag_names"]
+    tag_categories = model_state["tag_categories"]
 
-    if session is None or tags_df is None:
+    if session is None or not tag_names:
         raise RuntimeError("Model not loaded")
 
     # Prepare image
-    input_data = prepare_image(image_path)
+    input_data = prepare_image(image_input)
     input_name = session.get_inputs()[0].name
 
     # Run inference
     outputs = session.run(None, {input_name: input_data})[0][0]
-
-    # Parse tags by category
-    tag_names = tags_df["name"].tolist()
-    tag_categories = tags_df["category"].tolist()
 
     rating_tags = {}
     character_tags = {}
@@ -223,6 +248,63 @@ def run_inference(image_path: str, general_threshold: float, character_threshold
     }
 
 
+def extract_first_frame(video_path: str) -> Optional[Image.Image]:
+    """Extract the first valid frame from a video."""
+    import cv2
+    cap = cv2.VideoCapture(video_path)
+    ret, frame = cap.read()
+    cap.release()
+    if ret:
+        return Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    return None
+
+
+def tag_video(video_path: str, general_threshold: float, character_threshold: float) -> dict:
+    """Extract frames from video and aggregate tags."""
+    import cv2
+    cap = cv2.VideoCapture(video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    
+    if total_frames > 0:
+        frame_interval = max(int(total_frames / 50), 1)
+    else:
+        frame_interval = max(int(fps), 1) if fps > 0 else 1
+        
+    aggregated_rating = {}
+    aggregated_character = {}
+    aggregated_general = {}
+    
+    count = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if count % frame_interval == 0:
+            img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            tags = run_inference(img, general_threshold, character_threshold)
+            
+            for k, v in tags["rating"].items():
+                aggregated_rating[k] = max(aggregated_rating.get(k, 0), v)
+            for k, v in tags["characters"].items():
+                aggregated_character[k] = max(aggregated_character.get(k, 0), v)
+            for k, v in tags["general"].items():
+                aggregated_general[k] = max(aggregated_general.get(k, 0), v)
+                
+        count += 1
+    cap.release()
+    
+    rating_tags = dict(sorted(aggregated_rating.items(), key=lambda x: x[1], reverse=True))
+    character_tags = dict(sorted(aggregated_character.items(), key=lambda x: x[1], reverse=True))
+    general_tags = dict(sorted(aggregated_general.items(), key=lambda x: x[1], reverse=True))
+    
+    return {
+        "rating": rating_tags,
+        "characters": character_tags,
+        "general": general_tags,
+    }
+
+
 # ──────────────────────────────────────────────
 # API Endpoints
 # ──────────────────────────────────────────────
@@ -239,6 +321,26 @@ async def get_status():
     }
 
 
+@app.get("/api/browse-folder")
+async def browse_folder():
+    """Open a system dialog to select a folder."""
+    import tkinter as tk
+    from tkinter import filedialog
+    
+    loop = asyncio.get_event_loop()
+    
+    def _open_dialog():
+        root = tk.Tk()
+        root.attributes("-topmost", True)
+        root.withdraw()
+        folder_path = filedialog.askdirectory(title="Select Folder with Anime Images")
+        root.destroy()
+        return folder_path
+        
+    folder_path = await loop.run_in_executor(None, _open_dialog)
+    return {"folder_path": folder_path}
+
+
 @app.post("/api/scan")
 async def scan_folder(req: ScanRequest):
     """Scan a folder for anime images."""
@@ -246,9 +348,9 @@ async def scan_folder(req: ScanRequest):
 
     folder = Path(req.folder_path)
     if not folder.exists():
-        raise HTTPException(status_code=404, detail=f"Pasta não encontrada: {req.folder_path}")
+        raise HTTPException(status_code=404, detail=f"Folder not found: {req.folder_path}")
     if not folder.is_dir():
-        raise HTTPException(status_code=400, detail=f"Caminho não é uma pasta: {req.folder_path}")
+        raise HTTPException(status_code=400, detail=f"Path is not a folder: {req.folder_path}")
 
     # Reset store
     image_store = {}
@@ -259,6 +361,7 @@ async def scan_folder(req: ScanRequest):
     for f in sorted(folder.rglob("*")):
         if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS:
             image_id = f.stem
+            is_video = f.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS
             # Handle duplicate names
             counter = 1
             original_id = image_id
@@ -273,15 +376,17 @@ async def scan_folder(req: ScanRequest):
                 "size": f.stat().st_size,
                 "hash": None,  # Computed lazily
                 "tags": None,
+                "is_video": is_video,
             }
             images.append({
                 "id": image_id,
                 "filename": f.name,
                 "size": f.stat().st_size,
+                "is_video": is_video,
             })
 
     if not images:
-        raise HTTPException(status_code=404, detail="Nenhuma imagem encontrada na pasta")
+        raise HTTPException(status_code=404, detail="No images found in the folder")
 
     return {
         "folder": str(folder),
@@ -294,10 +399,10 @@ async def scan_folder(req: ScanRequest):
 async def tag_image(image_id: str, req: TagRequest):
     """Run tagger on a single image."""
     if model_state["status"] != "ready":
-        raise HTTPException(status_code=503, detail="Modelo ainda não está carregado")
+        raise HTTPException(status_code=503, detail="Model is not loaded yet")
 
     if image_id not in image_store:
-        raise HTTPException(status_code=404, detail=f"Imagem não encontrada: {image_id}")
+        raise HTTPException(status_code=404, detail=f"Image not found: {image_id}")
 
     img_data = image_store[image_id]
     image_path = img_data["path"]
@@ -308,7 +413,10 @@ async def tag_image(image_id: str, req: TagRequest):
             img_data["hash"] = compute_hash(image_path)
 
         # Run inference
-        tags = run_inference(image_path, req.general_threshold, req.character_threshold)
+        if img_data.get("is_video"):
+            tags = tag_video(image_path, req.general_threshold, req.character_threshold)
+        else:
+            tags = run_inference(image_path, req.general_threshold, req.character_threshold)
         img_data["tags"] = tags
 
         return {
@@ -319,17 +427,17 @@ async def tag_image(image_id: str, req: TagRequest):
         }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao processar imagem: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
 
 
 @app.post("/api/tag-all")
-async def tag_all_images(req: TagAllRequest):
+async def tag_all_images(req: TagRequest):
     """Run tagger on all scanned images. Returns results progressively."""
     if model_state["status"] != "ready":
-        raise HTTPException(status_code=503, detail="Modelo ainda não está carregado")
+        raise HTTPException(status_code=503, detail="Model is not loaded yet")
 
     if not image_store:
-        raise HTTPException(status_code=400, detail="Nenhuma imagem escaneada. Use /api/scan primeiro.")
+        raise HTTPException(status_code=400, detail="No images scanned. Use /api/scan first.")
 
     results = []
     errors = []
@@ -339,11 +447,18 @@ async def tag_all_images(req: TagAllRequest):
             if not img_data["hash"]:
                 img_data["hash"] = compute_hash(img_data["path"])
 
-            tags = run_inference(
-                img_data["path"],
-                req.general_threshold,
-                req.character_threshold,
-            )
+            if img_data.get("is_video"):
+                tags = tag_video(
+                    img_data["path"],
+                    req.general_threshold,
+                    req.character_threshold,
+                )
+            else:
+                tags = run_inference(
+                    img_data["path"],
+                    req.general_threshold,
+                    req.character_threshold,
+                )
             img_data["tags"] = tags
 
             results.append({
@@ -369,19 +484,35 @@ async def tag_all_images(req: TagAllRequest):
 async def get_image(image_id: str):
     """Serve an image file."""
     if image_id not in image_store:
-        raise HTTPException(status_code=404, detail=f"Imagem não encontrada: {image_id}")
+        raise HTTPException(status_code=404, detail=f"Image not found: {image_id}")
 
-    image_path = image_store[image_id]["path"]
+    img_data = image_store[image_id]
+    image_path = img_data["path"]
+    
+    if img_data.get("is_video"):
+        img = extract_first_frame(image_path)
+        if not img:
+            raise HTTPException(status_code=500, detail="Failed to extract video frame")
+        buf = io.BytesIO()
+        img.save(buf, format="WEBP", quality=90)
+        buf.seek(0)
+        return StreamingResponse(buf, media_type="image/webp")
+
     return FileResponse(image_path)
 
 # ──────────────────────────────────────────────
 # Clustering and Renaming
 # ──────────────────────────────────────────────
 
-def compute_dhash(image_path: str, hash_size: int = 8) -> str:
+def compute_dhash(image_path: str, hash_size: int = 8, is_video: bool = False) -> str:
     """Compute a difference hash (dHash) for an image."""
     try:
-        img = Image.open(image_path).convert("L")
+        if is_video:
+            img = extract_first_frame(image_path)
+            if not img: return '0' * (hash_size * hash_size)
+            img = img.convert("L")
+        else:
+            img = Image.open(image_path).convert("L")
         img = img.resize((hash_size + 1, hash_size), Image.LANCZOS)
         pixels = np.array(img)
         diff = pixels[:, 1:] > pixels[:, :-1]
@@ -445,7 +576,7 @@ async def apply_renames():
         items = []
         for img_id in img_ids:
             path = image_store[img_id]["path"]
-            dhash = compute_dhash(path)
+            dhash = compute_dhash(path, is_video=image_store[img_id].get("is_video", False))
             score = calculate_exposure_score(image_store[img_id]["tags"])
             items.append({"id": img_id, "path": path, "hash": dhash, "score": score})
             
@@ -507,12 +638,19 @@ async def apply_renames():
 async def get_thumbnail(image_id: str):
     """Serve a thumbnail of an image (max 400px)."""
     if image_id not in image_store:
-        raise HTTPException(status_code=404, detail=f"Imagem não encontrada: {image_id}")
+        raise HTTPException(status_code=404, detail=f"Image not found: {image_id}")
 
-    image_path = image_store[image_id]["path"]
+    img_data = image_store[image_id]
+    image_path = img_data["path"]
 
     try:
-        img = Image.open(image_path)
+        if img_data.get("is_video"):
+            img = extract_first_frame(image_path)
+            if not img:
+                raise HTTPException(status_code=500, detail="Failed to extract video frame")
+        else:
+            img = Image.open(image_path)
+            
         img.thumbnail((400, 400), Image.LANCZOS)
 
         # Convert to RGB if needed
@@ -530,7 +668,7 @@ async def get_thumbnail(image_id: str):
         return StreamingResponse(buf, media_type="image/webp")
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao gerar thumbnail: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error generating thumbnail: {str(e)}")
 
 
 def _format_export(img_data: dict, use_hash: bool) -> str:
@@ -586,11 +724,11 @@ def _get_export_filename(img_data: dict, use_hash: bool) -> str:
 async def export_tags(req: ExportRequest):
     """Export tags for a single image as a text file download."""
     if req.image_id not in image_store:
-        raise HTTPException(status_code=404, detail="Imagem não encontrada")
+        raise HTTPException(status_code=404, detail="Image not found")
 
     img_data = image_store[req.image_id]
     if not img_data.get("tags"):
-        raise HTTPException(status_code=400, detail="Imagem ainda não foi tageada")
+        raise HTTPException(status_code=400, detail="Image has not been tagged yet")
 
     content = _format_export(img_data, req.use_hash)
     filename = _get_export_filename(img_data, req.use_hash)
@@ -607,7 +745,7 @@ async def export_all_tags(req: ExportAllRequest):
     """Export all tagged images as a ZIP file."""
     tagged = {k: v for k, v in image_store.items() if v.get("tags")}
     if not tagged:
-        raise HTTPException(status_code=400, detail="Nenhuma imagem foi tageada ainda")
+        raise HTTPException(status_code=400, detail="No image has been tagged yet")
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -630,7 +768,7 @@ async def export_all_tags(req: ExportAllRequest):
 async def get_image_tags(image_id: str):
     """Get cached tags for an already-tagged image."""
     if image_id not in image_store:
-        raise HTTPException(status_code=404, detail="Imagem não encontrada")
+        raise HTTPException(status_code=404, detail="Image not found")
 
     img_data = image_store[image_id]
     return {

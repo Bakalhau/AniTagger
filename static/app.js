@@ -10,6 +10,7 @@ const state = {
     tagsCache: {},
     isProcessing: false,
     f95Enabled: false,
+    f95ActiveTags: new Set(),
 };
 
 // ── F95 Tag Mapping (WD tagger tag → F95 tag) ──
@@ -99,6 +100,7 @@ const dom = {
     charThreshold: $('charThreshold'), charThresholdValue: $('charThresholdValue'),
     f95Toggle: $('f95Toggle'), f95Panel: $('f95Panel'),
     f95Count: $('f95Count'), f95TagsList: $('f95TagsList'),
+    f95ResultArea: $('f95ResultArea'), f95ResultText: $('f95ResultText'), f95CopyBtn: $('f95CopyBtn'),
     renameToggle: $('renameToggle'), applyRenameBtn: $('applyRenameBtn')
 };
 
@@ -127,29 +129,81 @@ function computeF95Tags() {
     if (!state.f95Enabled) { dom.f95Panel.style.display = 'none'; return; }
     f95TagSources = {};
     for (const [imageId, cache] of Object.entries(state.tagsCache)) {
+        const addSource = (f95tag) => {
+            if (!f95TagSources[f95tag]) f95TagSources[f95tag] = new Set();
+            f95TagSources[f95tag].add(imageId);
+        };
+        
         const allTags = [...Object.keys(cache.general || {}), ...Object.keys(cache.characters || {}), ...Object.keys(cache.rating || {})];
         for (const tag of allTags) {
             const normalized = tag.toLowerCase().replace(/ /g, '_');
-            const addSource = (f95tag) => {
-                if (!f95TagSources[f95tag]) f95TagSources[f95tag] = new Set();
-                f95TagSources[f95tag].add(imageId);
-            };
             if (F95_TAG_MAP[normalized]) {
                 addSource(F95_TAG_MAP[normalized]);
             }
+        }
+        
+        // If there are any characters detected, add the 'Parody' tag
+        if (cache.characters && Object.keys(cache.characters).length > 0) {
+            addSource('Parody');
         }
     }
     const matched = Object.keys(f95TagSources).sort();
     dom.f95Panel.style.display = 'block';
     dom.f95Count.textContent = `${matched.length} tag${matched.length !== 1 ? 's' : ''}`;
+    
+    state.f95ActiveTags = new Set(matched);
+    
     if (matched.length === 0) {
         dom.f95TagsList.innerHTML = '<span class="f95-empty">No F95 tags matched from the detected tags</span>';
+        updateF95ResultArea();
     } else {
         dom.f95TagsList.innerHTML = matched.map(t => {
             const count = f95TagSources[t].size;
-            return `<span class="tag-badge f95 clickable" onclick="showF95Sources('${t.replace(/'/g, "\\'")}')" title="Click to see ${count} source image${count !== 1 ? 's' : ''}">${t} <span class="tag-score">${count}</span></span>`;
+            const safeTag = t.replace(/'/g, "\\'");
+            return `<span class="tag-badge f95 active">
+                <span class="f95-toggle-section" onclick="toggleF95Tag('${safeTag}', this.parentElement, event)" title="Enable/Disable tag">
+                    <span class="f95-dot"></span>
+                </span>
+                <span class="f95-content-section clickable" onclick="showF95Sources('${safeTag}')" title="Click to see ${count} source image${count !== 1 ? 's' : ''}">
+                    ${t} <span class="tag-score">${count}</span>
+                </span>
+            </span>`;
         }).join('');
+        updateF95ResultArea();
     }
+}
+
+function toggleF95Tag(tag, element, event) {
+    event.stopPropagation();
+    if (state.f95ActiveTags.has(tag)) {
+        state.f95ActiveTags.delete(tag);
+        element.classList.remove('active');
+    } else {
+        state.f95ActiveTags.add(tag);
+        element.classList.add('active');
+    }
+    updateF95ResultArea();
+}
+
+function updateF95ResultArea() {
+    if (state.f95ActiveTags.size === 0) {
+        dom.f95ResultArea.style.display = 'none';
+        dom.f95ResultText.textContent = '';
+    } else {
+        dom.f95ResultArea.style.display = 'flex';
+        const sortedTags = Array.from(state.f95ActiveTags).sort();
+        dom.f95ResultText.textContent = sortedTags.join(', ');
+    }
+}
+
+function copyF95Tags() {
+    const text = dom.f95ResultText.textContent;
+    if (!text) return;
+    navigator.clipboard.writeText(text).then(() => {
+        showToast('Tags copied to clipboard!', 'success');
+    }).catch(err => {
+        showToast('Failed to copy tags: ' + err, 'error');
+    });
 }
 
 function showF95Sources(f95Tag) {
@@ -202,7 +256,7 @@ dom.f95Toggle.addEventListener('change', () => {
     else dom.f95Panel.style.display = 'none';
 });
 
-// ── Rename Toggle ──
+// ── Generic API Wrapper ──
 dom.renameToggle.addEventListener('change', () => {
     dom.applyRenameBtn.style.display = dom.renameToggle.checked ? 'inline-flex' : 'none';
 });
@@ -270,7 +324,28 @@ async function checkModelStatus() {
     } catch (e) { /* server not ready */ }
 }
 
-// ── Folder Scanning ──
+// ── Folder Scanning & Browsing ──
+async function browseFolder() {
+    try {
+        const btn = document.getElementById('browseBtn');
+        const originalHtml = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span>';
+        
+        const res = await apiCall('/api/browse-folder');
+        const data = await res.json();
+        if (data.folder_path) {
+            dom.folderInput.value = data.folder_path;
+        }
+        
+        btn.disabled = false;
+        btn.innerHTML = originalHtml;
+    } catch (e) {
+        showToast('Failed to open folder dialog: ' + e.message, 'error');
+        document.getElementById('browseBtn').disabled = false;
+    }
+}
+
 async function scanFolder() {
     const folderPath = dom.folderInput.value.trim();
     if (!folderPath) { showToast('Paste a folder path first', 'error'); return; }
@@ -285,7 +360,8 @@ async function scanFolder() {
         dom.imageCount.textContent = `${data.total} images`;
         dom.taggedCount.textContent = '0 tagged';
         dom.exportAllBtn.disabled = true;
-        dom.f95Panel.style.display = 'none';
+        if (state.f95Enabled) computeF95Tags();
+        else dom.f95Panel.style.display = 'none';
         closeDetailPanel();
         showToast(`${data.total} images found!`, 'success');
     } catch (e) { showToast(e.message, 'error'); }
@@ -421,11 +497,11 @@ function updateCardChar(imageId, tags) {
 
 async function tagCurrentImage() {
     const imageId = state.selectedImageId; if (!imageId) return;
-    dom.tagSingleBtn.disabled = true;
-    dom.tagSingleBtn.innerHTML = '<span class="spinner"></span> Tagging...';
     try {
+        dom.tagSingleBtn.disabled = true; dom.tagSingleBtn.innerHTML = '<span class="spinner"></span>';
         const res = await apiCall(`/api/tag/${imageId}`, { method: 'POST', body: JSON.stringify(getThresholds()) });
         const data = await res.json();
+        
         state.tagsCache[imageId] = { ...data.tags, _hash: data.hash };
         updateCardChar(imageId, data.tags);
         renderDetailTags(state.tagsCache[imageId]);
@@ -453,6 +529,7 @@ async function tagAllImages() {
             try {
                 const res = await apiCall(`/api/tag/${img.id}`, { method: 'POST', body: JSON.stringify(getThresholds()) });
                 const data = await res.json();
+                
                 state.tagsCache[img.id] = { ...data.tags, _hash: data.hash };
                 updateCardChar(img.id, data.tags);
             } catch (e) { console.error(`Error tagging ${img.id}:`, e); }
